@@ -47,7 +47,7 @@ function post(url, form, headers) {
     const mod = u.protocol === 'http:' ? http : https;
     const req = mod.request({
       method: 'POST', hostname: u.hostname, port: u.port || undefined, path: u.pathname + u.search,
-      headers: { ...headers, 'Content-Length': Buffer.byteLength(form) }, timeout: 20000,
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(form) }, timeout: 7000,
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -60,7 +60,7 @@ function post(url, form, headers) {
   });
 }
 
-async function api(path, body, fallback) {
+async function apiOnce(path, body) {
   const form = new URLSearchParams({ parameter: enc(body) }).toString();
   const text = await post(API + path, form, {
     'User-Agent': 'okhttp/3.12.0',
@@ -70,10 +70,21 @@ async function api(path, body, fallback) {
     'client-channel': '',
     token: '',
   });
-  const j = JSON.parse(text);
-  return j && j.data ? JSON.parse(dec(j.data)) : fallback;
+  let j;
+  try { j = JSON.parse(text); } catch { throw new Error('接口返回异常 ' + text.slice(0, 40)); }
+  if (!j || !j.data) throw new Error('接口无数据 ' + String(j?.code ?? '') + ' ' + String(j?.msg ?? j?.message ?? '').slice(0, 30));
+  return JSON.parse(dec(j.data));
 }
 
+async function api(path, body) {
+  let err;
+  for (let i = 0; i < 2; i++) {
+    try { return await apiOnce(path, body); } catch (e) { err = e; }
+  }
+  throw err;
+}
+
+const cache = new Map(); // 分类结果缓存：接口偶尔失败时用上一次的
 function fmtTime(ms) {
   const t = new Date(ms + 8 * 3600 * 1000); // 统一按北京时间显示
   return `${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())} ${pad(t.getUTCHours())}:${pad(t.getUTCMinutes())}`;
@@ -92,7 +103,14 @@ const spider = {
     const page = parseInt(body.page || body.pg || 1, 10) || 1;
     if (page !== 1) return { page, pagecount: 1, limit: 999, total: 0, list: [] };
     const tid = s(body.id || body.tid, 'hot');
-    const data = await api('/gz/live/sports?parameter=key', QUERY[tid] || QUERY.hot, []);
+    let data;
+    try {
+      data = await api('/gz/live/sports?parameter=key', QUERY[tid] || QUERY.hot);
+      if (Array.isArray(data) && data.length) cache.set(tid, data);
+    } catch (e) {
+      data = cache.get(tid);
+      if (!data) throw e;
+    }
     const since = Date.now() - 24 * 3600 * 1000;
     const list = [];
     for (const m of Array.isArray(data) ? data : []) {
@@ -102,13 +120,14 @@ const spider = {
       const remarks = `${s(m?.event_name)} ${fmtTime(t)} ${s(m?.match_status_info)}`.trim() + scoreText(h, v);
       list.push({ vod_id: s(m?.mid), vod_name: `${s(h.name)} vs ${s(v.name)}`, vod_pic: s(h.logo), vod_remarks: remarks });
     }
+    if (!list.length) list.push({ vod_id: 'empty', vod_name: '当前分类暂无比赛', vod_pic: '', vod_remarks: '瓜子体育' });
     return { page: 1, pagecount: 1, limit: 999, total: list.length, list };
   },
 
   async detail(body = {}) {
     const id = s(Array.isArray(body.id) ? body.id[0] : body.id);
     if (!id) throw new Error('瓜子体育参数为空');
-    const d = await api('/gz/live/detail?parameter=key', JSON.stringify({ mid: id }), {});
+    const d = await api('/gz/live/detail?parameter=key', JSON.stringify({ mid: id }));
     const h = d?.home || {}, v = d?.visiting || {};
     const remarks = s(d?.match_status_info) + scoreText(h, v);
     const lines = Array.isArray(d?.live_line) ? d.live_line : [];
@@ -137,7 +156,7 @@ const spider = {
     let url = raw;
     if (raw.includes('|||')) {
       const [mid, idx] = raw.split('|||');
-      const d = await api('/gz/live/detail?parameter=key', JSON.stringify({ mid }), {});
+      const d = await api('/gz/live/detail?parameter=key', JSON.stringify({ mid }));
       const lines = Array.isArray(d?.live_line) ? d.live_line : [];
       url = s(lines[Number(idx)]?.m3u8 || lines.find((l) => l?.m3u8)?.m3u8);
       if (!url) throw new Error('瓜子体育暂无直播源');
@@ -215,6 +234,9 @@ async function handler(req, res) {
 }
 
 let server = null;
+// 防止单次请求的意外异常把整个源进程带崩
+process.on('uncaughtException', (e) => console.error('[guazi] uncaught', e?.message || e));
+process.on('unhandledRejection', (e) => console.error('[guazi] unhandled', e?.message || e));
 async function start(opts = {}) {
   stopped = false;
   server = typeof globalThis.catServerFactory === 'function'
