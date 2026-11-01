@@ -207,17 +207,25 @@ async function start(opts = {}) {
   server = typeof globalThis.catServerFactory === 'function'
     ? globalThis.catServerFactory(handler, {})
     : http.createServer(handler);
-  let port = Number(opts.port || process.env.DEV_HTTP_PORT || process.env.PORT || 9988);
-  const host = process.env.HOST || '0.0.0.0';
+  const inApp = typeof globalThis.catServerFactory === 'function';
+  let port = Number(process.env.DEV_HTTP_PORT || (inApp ? 0 : process.env.PORT || 9988));
+  const host = inApp ? '127.0.0.1' : process.env.HOST || '0.0.0.0';
   for (;;) {
     try {
       await new Promise((ok, bad) => { server.once('error', bad); server.listen(port, host, ok); });
       break;
     } catch (e) {
-      if (e?.code !== 'EADDRINUSE') throw e;
+      if (e?.code !== 'EADDRINUSE' || port === 0) throw e;
       port += 1;
     }
   }
+  const addr = server.address.bind(server);
+  server.address = function () {
+    const r = addr();
+    if (r && typeof r === 'object') { r.url = `http://127.0.0.1:${r.port}`; r.dynamic = 'js2p://_WEB_'; }
+    return r;
+  };
+  port = server.address()?.port || port;
   console.log(`CatVodSpiderios listening on http://127.0.0.1:${port}`);
   return server;
 }
