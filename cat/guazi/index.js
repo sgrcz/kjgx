@@ -4,6 +4,7 @@
  * 路由与原包一致：/config、/check、/health、/spider/guazisport/3/{init,home,category,detail,play,search}
  */
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 
 const API = 'https://api.46d5umpk.com';
@@ -39,29 +40,38 @@ function dec(b64) {
   return Buffer.concat([d.update(String(b64), 'base64'), d.final()]).toString('utf8');
 }
 
+function post(url, form, headers) {
+  // 不依赖全局 fetch：App 内置 Node 可能没有 fetch
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = u.protocol === 'http:' ? http : https;
+    const req = mod.request({
+      method: 'POST', hostname: u.hostname, port: u.port || undefined, path: u.pathname + u.search,
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(form) }, timeout: 20000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(form);
+  });
+}
+
 async function api(path, body, fallback) {
   const form = new URLSearchParams({ parameter: enc(body) }).toString();
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
-  try {
-    const r = await fetch(API + path, {
-      method: 'POST',
-      headers: {
-        'User-Agent': 'okhttp/3.12.0',
-        'content-type': 'application/x-www-form-urlencoded',
-        'user-platform': 'null',
-        'client-version': '3.0.1.1',
-        'client-channel': '',
-        token: '',
-      },
-      body: form,
-      signal: ctrl.signal,
-    });
-    const j = await r.json();
-    return j && j.data ? JSON.parse(dec(j.data)) : fallback;
-  } finally {
-    clearTimeout(timer);
-  }
+  const text = await post(API + path, form, {
+    'User-Agent': 'okhttp/3.12.0',
+    'content-type': 'application/x-www-form-urlencoded',
+    'user-platform': 'null',
+    'client-version': '3.0.1.1',
+    'client-channel': '',
+    token: '',
+  });
+  const j = JSON.parse(text);
+  return j && j.data ? JSON.parse(dec(j.data)) : fallback;
 }
 
 function fmtTime(ms) {
@@ -197,7 +207,10 @@ async function handler(req, res) {
     }
     send(res, 404, { msg: 'not found' });
   } catch (e) {
-    send(res, 200, { list: [], msg: String(e?.message || e) });
+    const msg = String(e?.message || e);
+    // 分类出错时把原因显示成一条，方便排查
+    if (u.pathname.endsWith('/category')) return send(res, 200, { page: 1, pagecount: 1, limit: 999, total: 1, list: [{ vod_id: 'err', vod_name: '出错：' + msg.slice(0, 60), vod_pic: '', vod_remarks: '瓜子体育' }], msg });
+    send(res, 200, { list: [], msg });
   }
 }
 
